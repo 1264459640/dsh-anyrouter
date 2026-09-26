@@ -10,7 +10,8 @@ import type {
   CredentialRecordInfo,
   CredentialRef,
 } from '@deepseek-ai/dsh-credentials'
-import { DEFAULT_API_KEY_ENV } from '../src/config.ts'
+import { DEFAULT_API_KEY_ENV, SETTINGS_NS } from '../src/config.ts'
+import { patchEntryId } from './helpers/patch-entry-ids.ts'
 import * as anyrouter from '../src/index.ts'
 
 class MemoryCredentials extends CredentialProvider {
@@ -78,7 +79,7 @@ describe('Cordis plugin lifecycle', () => {
         expect.objectContaining({ id: 'claude-opus-5' }),
       ])
       expect(ctx.llm.providerRetryPolicy('anyrouter')).toMatchObject({ mode: 'normal', maxRetries: 5 })
-      await expect(ctx.llm.discoverModels('llm-anyrouter', {
+      await expect(ctx.llm.discoverModels(SETTINGS_NS, {
         provider: 'anyrouter',
         baseURL: 'https://anyrouter.top',
         apiKey: 'sk-draft',
@@ -105,9 +106,41 @@ describe('Cordis plugin lifecycle', () => {
 
       expect(ctx.llm.listProviders()).toEqual([])
       expect(ctx.llm.listConfigurableProviders().map(entry => entry.provider)).toContain('anyrouter')
+      // The directory entry's settings namespace is what a browser settings
+      // surface looks the form up by, so it must be the profile entry id.
+      const directory = ctx.llm.listConfigurableProviders().find(entry => entry.provider === 'anyrouter')
+      expect(directory?.settingsNs).toBe(patchEntryId())
+      expect(directory?.settingsNs).toBe(SETTINGS_NS)
+      expect(directory?.settingsPath).toEqual([])
       await expect(ctx.llm.listModels('anyrouter')).rejects.toThrow(/not registered|no adapter/i)
 
       await fiber.dispose()
+    })
+  })
+
+  it('honors the 0.1.7 bare-signal discovery signature', async () => {
+    await withoutAmbientKey(async () => {
+      // A listing that would succeed if the signal were dropped: an ABORTED
+      // rejection is therefore evidence the callback read its second argument.
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ data: [
+        { id: 'claude-opus-5' },
+      ] }), { status: 200, headers: { 'content-type': 'application/json' } })))
+      const ctx = new Context()
+      await ctx.plugin(LlmRuntime)
+      await ctx.plugin(MemoryCredentials)
+      ;(ctx.get('credentials') as MemoryCredentials).present = true
+      await ctx.plugin(anyrouter, {
+        models: [{ id: 'claude-opus-5', protocol: 'claude-code' }],
+      })
+      await settled()
+
+      const controller = new AbortController()
+      controller.abort(new Error('cancelled'))
+      await expect(ctx.llm.discoverModels(SETTINGS_NS, {
+        provider: 'anyrouter',
+        baseURL: 'https://anyrouter.top',
+        apiKey: 'sk-draft',
+      }, controller.signal)).rejects.toMatchObject({ code: 'ABORTED' })
     })
   })
 

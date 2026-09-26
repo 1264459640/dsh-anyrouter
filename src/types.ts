@@ -1,1 +1,1 @@
-export type { AnyRouterModelConfig, AnyRouterProtocol, Config, ResolvedConfig } from './config.ts'
+export type { AnyRouterModelConfig, AnyRouterProtocol, Config, Options, ResolvedConfig } from './config.ts'

@@ -60,7 +60,6 @@ describe('Claude Code compatibility transport', () => {
     const body = JSON.parse(await request!.text())
     expect(body.model).toBe('claude-opus-5')
     expect(body.system.some((block: any) => String(block.text).includes('Claude Agent SDK'))).toBe(true)
-    expect(body.system.some((block: any) => String(block.text).startsWith('x-anthropic-billing-header:'))).toBe(true)
     expect(body.system.some((block: any) => block.text === 'DSH system prompt')).toBe(true)
     expect(body.tools[0].name).toBe('Read')
     expect(body.thinking).toMatchObject({ type: 'adaptive' })

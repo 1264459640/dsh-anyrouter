@@ -8,7 +8,7 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const PACKAGE_NAME = 'dsh-anyrouter'
-export const DEFAULT_SOURCE = 'github:shaomingbo/dsh-anyrouter#v0.3.3'
+export const DEFAULT_SOURCE = 'github:shaomingbo/dsh-anyrouter#v0.3.4'
 const COMMANDS = ['install', 'status', 'uninstall']
 
 export function parseArgs(argv) {
@@ -119,7 +119,10 @@ Options:
 The installer only edits dependencies.${PACKAGE_NAME} and dsh.profile.bundles in
 the profile package.json, then runs pnpm install --ignore-scripts there.
 It never stops or restarts DSH; restart DSH manually afterwards.
-Your credentials and synchronized models are kept on uninstall.`)
+Your credentials and synchronized models are kept on uninstall.
+Upgrading: a legacy llm-anyrouter: section in settings.yaml is no longer read,
+so re-sync the model list once from Settings -> AnyRouter. The API key in the
+credentials store survives.`)
 }
 
 export async function run(argv = process.argv.slice(2), deps = {}) {

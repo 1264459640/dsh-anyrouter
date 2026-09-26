@@ -63,7 +63,12 @@ async function* restoredEvents(events: AsyncIterable<AssistantMessageEvent>): As
   }
 }
 
-function runCodex(model: Model<Api>, context: Context, options?: SimpleStreamOptions): AsyncIterable<AssistantMessageEvent> {
+function runCodex(
+  model: Model<Api>,
+  context: Context,
+  options: SimpleStreamOptions | undefined,
+  send: typeof globalThis.fetch,
+): AsyncIterable<AssistantMessageEvent> {
   const attribution = typeof options?.headers?.['user-agent'] === 'string'
     ? ` ${options.headers['user-agent']}`
     : ''
@@ -78,6 +83,12 @@ function runCodex(model: Model<Api>, context: Context, options?: SimpleStreamOpt
   const events = openAIResponsesStreamSimple(nativeModel, nativeContext(context), {
     ...options,
     transport: 'sse',
+    // pi-ai hands this straight to the OpenAI client (`createClient` in
+    // `@earendil-works/pi-ai/dist/api/openai-responses.js:175-207`), which takes
+    // `options.fetch ?? globalThis.fetch`. Supplying the route's own `fetch` is
+    // therefore enough to tunnel this transport without touching the global
+    // dispatcher the OpenAI SDK would otherwise resolve.
+    fetch: send,
     headers,
     maxRetries: 0,
     onPayload: async (payload) => {
@@ -90,11 +101,32 @@ function runCodex(model: Model<Api>, context: Context, options?: SimpleStreamOpt
   return restoredEvents(events)
 }
 
-export const codexResponsesStreams: ProviderStreams = {
-  stream(model: Model<Api>, context: Context, options?: StreamOptions) {
-    return runCodex(model, context, options as SimpleStreamOptions | undefined) as ReturnType<ProviderStreams['stream']>
-  },
-  streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions) {
-    return runCodex(model, context, options) as ReturnType<ProviderStreams['streamSimple']>
-  },
+/**
+ * Build the Codex Responses transport for one route.
+ *
+ * Mirrors {@link createClaudeCodeStreams}: the `fetch` is resolved per request
+ * so a live proxy edit applies to the next request, and a route with no proxy
+ * gets the global `fetch` exactly as before.
+ * @param resolveFetch - supplies the `fetch` this route must send with.
+ * @returns the stream functions pi-ai's provider registry expects.
+ */
+export function createCodexResponsesStreams(
+  resolveFetch: () => typeof globalThis.fetch = () => globalThis.fetch,
+): ProviderStreams {
+  return {
+    stream(model: Model<Api>, context: Context, options?: StreamOptions) {
+      return runCodex(
+        model,
+        context,
+        options as SimpleStreamOptions | undefined,
+        resolveFetch(),
+      ) as ReturnType<ProviderStreams['stream']>
+    },
+    streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions) {
+      return runCodex(model, context, options, resolveFetch()) as ReturnType<ProviderStreams['streamSimple']>
+    },
+  }
 }
+
+/** The direct-connection transport: the route with no proxy configured. */
+export const codexResponsesStreams: ProviderStreams = createCodexResponsesStreams()

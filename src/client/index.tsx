@@ -4,10 +4,18 @@ import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
 import { MODEL_PROFILES_BY_ID } from '../model-profiles.generated.ts'
 
-const SETTINGS_NS = 'llm-anyrouter'
+// DSH 0.1.7 identifies a settings namespace by the nominal id of one profile
+// plugin entry. `cordis.patch.yml` inserts our Host half as `id: dsh-anyrouter`,
+// so that entry id IS the namespace, replacing the pre-0.1.7 standalone
+// `llm-*` section key. It is also the `entryId` `ConfigForms.get` expects, and
+// the `ns` the Host reports in `settings.describe`. The Host half was moved to
+// the same value.
+const SETTINGS_NS = 'dsh-anyrouter'
 const PROVIDER = 'anyrouter'
 const API_KEY_REF = 'ANYROUTER_API_KEY'
 const DEFAULT_BASE_URL = 'https://anyrouter.top'
+/** Empty means direct: only a non-empty value tunnels this provider's traffic. */
+const DEFAULT_PROXY = ''
 const LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 type Level = (typeof LEVELS)[number]
 type Protocol = 'claude-code' | 'codex-responses'
@@ -30,6 +38,7 @@ interface SyncedModel {
 
 interface SettingsValue {
   baseURL?: string
+  proxy?: string
   models?: SyncedModel[]
 }
 
@@ -46,17 +55,26 @@ interface PickerRow {
   adaptive: boolean
 }
 
-interface SettingsScopeSnapshot {
+/**
+ * The section's slice of `ConfigFormSnapshot<T>`
+ * (`@deepseek-ai/dsh-client-ui-settings/lib/types/client/config-form-types.d.ts:6-32`).
+ * `idle` is deliberately absent: that state belongs to the shared
+ * `SettingsMirrorSnapshot`, while a per-entry form only ever reports
+ * `loading | ready | unavailable`.
+ */
+interface SettingsFormViewSnapshot {
   status: 'loading' | 'ready' | 'unavailable'
   value: SettingsValue | undefined
   writable: boolean
   mode: 'host' | 'memory'
 }
 
-interface SettingsScope {
-  getSnapshot(): SettingsScopeSnapshot
+/** The section's slice of `ConfigForm<T>` (same file, lines 36-74). */
+interface SettingsFormView {
+  getSnapshot(): SettingsFormViewSnapshot
   subscribe(listener: () => void): () => void
-  set(field: string, value: unknown): Promise<void>
+  /** @returns true when the Host accepted the write, false for refusal. */
+  set(field: string, value: unknown): Promise<boolean>
 }
 
 /** One model an endpoint reports about itself during discovery. */
@@ -220,11 +238,12 @@ const styles = `
 .dsh-any-levels button[data-on=true]:hover:enabled { background: var(--dsw-alias-button-primary-hover, #43454a); }
 .dsh-any-levels select { border-radius: 8px; border: 1px solid var(--dsw-alias-border-l3, rgba(0, 0, 0, .12)); background: var(--dsw-alias-bg-base, #fff); color: var(--dsw-alias-label-primary, #0f1115); padding: 4px 8px; }
 .dsh-any-empty { margin-top: 10px; font-size: 13px; color: var(--dsw-alias-label-caption, #adb2b8); }
+.dsh-any-hint { margin: 0; font-size: 12px; color: var(--dsw-alias-label-caption, #adb2b8); }
 `
 
 interface SectionProps {
   ops: AnyRouterOperations
-  scope: SettingsScope
+  scope: SettingsFormView
   subscribeCredentials: (refresh: () => void) => () => void
 }
 
@@ -350,6 +369,7 @@ function Section({ ops, scope, subscribeCredentials }: SectionProps): ReactEleme
   const [configured, setConfigured] = useState(false)
   const [apiKey, setApiKey] = useState('')
   const [baseURL, setBaseURL] = useState(DEFAULT_BASE_URL)
+  const [proxy, setProxy] = useState(DEFAULT_PROXY)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
@@ -363,6 +383,11 @@ function Section({ ops, scope, subscribeCredentials }: SectionProps): ReactEleme
     const next = snapshot.value?.baseURL ?? DEFAULT_BASE_URL
     if (!busy) setBaseURL(next)
   }, [busy, snapshot.value?.baseURL])
+
+  useEffect(() => {
+    const next = snapshot.value?.proxy ?? DEFAULT_PROXY
+    if (!busy) setProxy(next)
+  }, [busy, snapshot.value?.proxy])
 
   useEffect(() => {
     alive.current = true
@@ -394,10 +419,24 @@ function Section({ ops, scope, subscribeCredentials }: SectionProps): ReactEleme
 
   const persistBaseURL = async (operation: ReturnType<typeof beginOperation>): Promise<void> => {
     const nextBaseURL = baseURL.trim() || DEFAULT_BASE_URL
-    await scope.set('baseURL', nextBaseURL)
+    // 0.1.7 `ConfigForm.set` resolves false when the Host refuses the write
+    // (config-form-types.d.ts:55-65); transport failures reject instead. Treat
+    // a refusal as a failure now rather than relying only on the read-back.
+    const accepted = await scope.set('baseURL', nextBaseURL)
     if (!operation.active()) throw new Error('操作已中断。')
-    if (scope.getSnapshot().value?.baseURL !== nextBaseURL) {
+    if (accepted === false || scope.getSnapshot().value?.baseURL !== nextBaseURL) {
       throw new Error('API 地址未能保存，请检查格式后重试。')
+    }
+  }
+
+  const persistProxy = async (operation: ReturnType<typeof beginOperation>): Promise<void> => {
+    const nextProxy = proxy.trim()
+    // An empty string is a real value here — it clears the proxy and restores a
+    // direct connection — so it is written rather than skipped.
+    const accepted = await scope.set('proxy', nextProxy)
+    if (!operation.active()) throw new Error('操作已中断。')
+    if (accepted === false || (scope.getSnapshot().value?.proxy ?? '') !== nextProxy) {
+      throw new Error('代理未能保存，请检查格式后重试（仅支持 http:// 或 https:// 代理地址）。')
     }
   }
 
@@ -412,6 +451,7 @@ function Section({ ops, scope, subscribeCredentials }: SectionProps): ReactEleme
       }
       if (!operation.active()) return
       await persistBaseURL(operation)
+      await persistProxy(operation)
       setApiKey('')
       setConfigured(true)
       setSuccess('API Key 已保存。提供方已启用，模型将出现在模型选择器。')
@@ -421,7 +461,7 @@ function Section({ ops, scope, subscribeCredentials }: SectionProps): ReactEleme
     } finally {
       if (operation.active()) setBusy(false)
     }
-  }, [apiKey, baseURL, beginOperation, ops, refreshCredential, scope])
+  }, [apiKey, baseURL, proxy, beginOperation, ops, refreshCredential, scope])
 
   const discover = useCallback(async () => {
     const operation = beginOperation()
@@ -433,6 +473,12 @@ function Section({ ops, scope, subscribeCredentials }: SectionProps): ReactEleme
         await ops.storeCredential(apiKey.trim())
         if (!operation.active()) return
       }
+      // Unlike the endpoint, the proxy has to be SAVED before discovery runs:
+      // the Host's `remote.llm.discoverModels` call can carry a draft baseURL
+      // but has no field for a draft proxy, so the Host would still tunnel
+      // through the previously saved value. Persisting it here is what makes
+      // "paste proxy, press 同步模型" work in one step.
+      await persistProxy(operation)
       const discovered = await ops.discoverModels(baseURL.trim() || DEFAULT_BASE_URL)
       if (!operation.active()) return
       const saved = new Map(models.map(model => [model.id, model]))
@@ -479,6 +525,8 @@ function Section({ ops, scope, subscribeCredentials }: SectionProps): ReactEleme
     try {
       await persistBaseURL(operation)
       const nextModels = picker.filter(row => row.checked).map(rowToSaved)
+      // 0.1.7 answers a refusal with `false` after reloading Host state, so the
+      // read-back below catches it without a separate boolean check.
       await scope.set('models', nextModels)
       if (!operation.active()) throw new Error('操作已中断。')
       const savedModels = scope.getSnapshot().value?.models
@@ -501,8 +549,16 @@ function Section({ ops, scope, subscribeCredentials }: SectionProps): ReactEleme
     setError(null)
     try {
       const nextModels = models.filter(model => model.id !== id)
-      await scope.set('models', nextModels)
+      // A refused write stays silent otherwise: the summary below is derived
+      // from local `models`, not from the snapshot, so it would claim a removal
+      // the Host never committed.
+      if (await scope.set('models', nextModels) === false) {
+        throw new Error('模型列表未能保存，请重试。')
+      }
       if (!operation.active()) throw new Error('操作已中断。')
+      if (scope.getSnapshot().value?.models?.some(model => model.id === id)) {
+        throw new Error('模型列表未能保存，请重试。')
+      }
       setSuccess(`已移除 ${id}。`)
     } catch (reason) {
       if (operation.active()) setError(errorMessage(reason))
@@ -546,6 +602,24 @@ function Section({ ops, scope, subscribeCredentials }: SectionProps): ReactEleme
             disabled={busy || !writable}
             onChange={event => setBaseURL(event.target.value)}
           />
+        </div>
+        <div className="dsh-any-field">
+          <label htmlFor="dsh-any-proxy">代理（只作用于本提供方，留空为直连）</label>
+          <input
+            id="dsh-any-proxy"
+            type="text"
+            autoComplete="off"
+            spellCheck={false}
+            placeholder="http://127.0.0.1:7890"
+            value={proxy}
+            disabled={busy || !writable}
+            onChange={event => setProxy(event.target.value)}
+          />
+          <p className="dsh-any-hint">
+            只让 AnyRouter 的请求走这个代理，不影响其它提供方，也不改动 DSH 的全局代理。
+            填 http:// 或 https:// 代理地址（需要认证可写成 http://user:pass@host:port）；
+            SOCKS 不支持，请填同一客户端的 HTTP 端口。localhost 与 127.0.0.1 始终直连。
+          </p>
         </div>
         <div className="dsh-any-actions">
           <button type="button" disabled={busy || loading || !writable || (apiKey.trim().length === 0 && !configured)} onClick={save}>保存配置</button>
@@ -596,11 +670,20 @@ function Section({ ops, scope, subscribeCredentials }: SectionProps): ReactEleme
  * Required services. `remote.credentials` and `remote.llm` are the Host
  * capabilities this section is built on; declaring them keeps activation
  * waiting until both namespaces are mounted rather than crashing the slot.
+ * `configForms` replaces the pre-0.1.7 browser settings-scope service and
+ * carries the writes. `remote.settings` is deliberately NOT declared: the
+ * ConfigForms provider owns that write path and reads `ctx` as its *providing*
+ * fiber, so it is the settings plugin — not this consumer — that must inject
+ * `remote.settings` (see config-form.d.ts:113-118 and
+ * dsh-client-ui-settings/lib/client.js:1503). Declaring it here would be dead
+ * weight. `slots` declares the render seat; `settings.section` itself needs no
+ * declaration in `inject` because `slots.inject()` already defers registration
+ * until the seat exists (the shipped ui-settings-models client does the same).
  */
-export const inject = ['slots', 'remote', 'remote.credentials', 'remote.llm', 'settingsScope']
+export const inject = ['slots', 'remote', 'remote.credentials', 'remote.llm', 'configForms']
 
 /** DSH versions whose Client contract this plugin was built and verified against. */
-const SUPPORTED_HOST = '@deepseek-ai/dsh-web-app 0.1.2-alpha.3 or later'
+const SUPPORTED_HOST = '@deepseek-ai/dsh-web-app 0.1.7-rc.2 or later'
 
 /**
  * The sole seam between this plugin and the DSH Client contract: every Host
@@ -613,8 +696,10 @@ function createOperations(ctx: any): AnyRouterOperations {
   const remote = ctx.remote
   // Capability probe: `connection.api` carried these calls up to 0.1.1-rc.2 and
   // was removed in 0.1.2-alpha.3, which moved them onto typed Remote
-  // namespaces. Only the Remote shape is verified, so a Host without it fails
-  // loudly instead of degrading onto an unverified path.
+  // namespaces; 0.1.7-rc.2 keeps those namespaces and replaces the pre-0.1.7
+  // browser settings-scope service with `ctx.configForms`. Only the Remote shape
+  // is verified here, so a Host without it fails loudly instead of degrading
+  // onto an unverified path.
   if (remote?.credentials?.describe === undefined || remote?.llm?.discoverModels === undefined) {
     throw new Error(
       `dsh-anyrouter: this DSH build exposes no remote.credentials/remote.llm namespaces. `
@@ -646,16 +731,40 @@ function createOperations(ctx: any): AnyRouterOperations {
   }
 }
 
+/**
+ * Adapt one 0.1.7 `ConfigForm<SettingsValue>` to the narrow `SettingsFormView` the
+ * section consumes, so the component keeps reading `getSnapshot/subscribe/set`
+ * without knowing about `ConfigForm` or its extra seats
+ * (`base`/`user`/`revision`/`mutate`/`unset`).
+ *
+ * `ConfigForms.get(entryId)` takes the Host plugin entry id, which is exactly
+ * `SETTINGS_NS`; the form's own decoder defaults to the namespace's serialized
+ * wire schema, so the hand-written `decode` that the pre-0.1.7 browser
+ * settings-scope seam needed is no longer required. A schema that
+ * admits a non-object section would emit one whose `value.models`/`value.baseURL`
+ * reads both yield undefined, and the section already treats that as empty.
+ * @param form - the shared form for our Host entry.
+ * @returns the section-facing view of it.
+ */
+function createScope(form: { getSnapshot(): unknown; subscribe(listener: () => void): () => void; set(field: string, value: unknown): Promise<boolean> }): SettingsFormView {
+  return {
+    getSnapshot: () => form.getSnapshot() as SettingsFormViewSnapshot,
+    subscribe: listener => form.subscribe(listener),
+    set: (field, value) => form.set(field, value),
+  }
+}
+
 export function apply(ctx: any): void {
   const ops = createOperations(ctx)
-  const scope: SettingsScope = ctx.get('settingsScope').bind({
-    namespace: SETTINGS_NS,
-    decode: (section: unknown): SettingsValue | undefined => typeof section === 'object'
-      && section !== null
-      && !Array.isArray(section)
-      ? section as SettingsValue
-      : undefined,
-  })
+  // The section edits the namespace owned by our own Host half. `whileServed`
+  // keeps the nav entry out of a deployment that mounted this Client bundle
+  // without the Host entry — the documented remedy for "a page edits a
+  // namespace another plugin owns" (config-form.d.ts:143-156). Without it, such
+  // a page could only ever render its permanent `loading` state. The caller
+  // owns the returned disposer, so it is wrapped in `ctx.effect`, matching the
+  // shipped ui-settings-web-search registration
+  // (dsh-client-ui-settings-web-search/lib/client.js:300-314).
+  const scope = createScope(ctx.configForms.get(SETTINGS_NS))
   const subscribeCredentials = (refresh: () => void): (() => void) => {
     const disposers: Array<() => void> = []
     try {
@@ -674,11 +783,15 @@ export function apply(ctx: any): void {
     document.head.appendChild(element)
     return () => element.remove()
   }, 'dsh-anyrouter: settings styles')
-  ctx.slots.inject('settings.section', () => ctx.slots.register({
+  const install = (): (() => void) => ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section',
     id: PROVIDER,
     order: 11,
     label: () => 'AnyRouter',
     inject: () => ({ ops, scope, subscribeCredentials }),
   }, Section))
+  ctx.effect(
+    () => ctx.configForms.whileServed([SETTINGS_NS], install),
+    'dsh-anyrouter: settings section',
+  )
 }

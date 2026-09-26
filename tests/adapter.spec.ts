@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { AnyRouterAdapter, providerProfileOf } from '../src/adapter.ts'
 import { resolveConfig } from '../src/config.ts'
+import { MODEL_PROFILES_BY_ID } from '../src/model-profiles.generated.ts'
 
 function adapter() {
   const config = resolveConfig({
@@ -27,11 +28,30 @@ describe('AnyRouterAdapter catalog', () => {
       id: 'claude-opus-5',
       context: { contextWindow: 1_000_000 },
       reasoning: {
-        efforts: expect.arrayContaining([
-          expect.objectContaining({ id: 'off' }),
-          expect.objectContaining({ id: 'high' }),
-          expect.objectContaining({ id: 'max' }),
-        ]),
+        // The selectable set is the GENERATED reference profile's own effort
+        // list, not a hand-written expectation: pi-ai 0.85.1's catalog changed
+        // which levels a given model supports (first-party Anthropic no longer
+        // advertises `off` for its adaptive models), so asserting a literal
+        // list here would pin the catalog, not this adapter's projection of it.
+        efforts: MODEL_PROFILES_BY_ID.get('claude-opus-5')!.efforts
+          .map(effort => expect.objectContaining({ id: effort })),
+      },
+    })
+  })
+
+  it('projects every catalog-declared level for a stateful model', async () => {
+    // `claude-sonnet-4.5` is budget-thinking (not adaptive), so its reference
+    // profile still declares `off`. It is the shape that proves the `off`
+    // level reaches the selector at all.
+    const config = resolveConfig({
+      models: [{ id: 'claude-sonnet-4.5', protocol: 'claude-code' }],
+    })
+    const subject = new AnyRouterAdapter({ config: () => config, resolveApiKey: async () => 'sk-test' })
+    const reference = MODEL_PROFILES_BY_ID.get('claude-sonnet-4.5')!
+    expect(reference.efforts).toContain('off')
+    await expect(subject.resolveModel('anyrouter', 'claude-sonnet-4.5')).resolves.toMatchObject({
+      reasoning: {
+        efforts: reference.efforts.map(effort => expect.objectContaining({ id: effort })),
       },
     })
   })
@@ -64,12 +84,13 @@ describe('AnyRouterAdapter catalog', () => {
 
 describe('seam profile contract', () => {
   /**
-   * The seam dereferences these maps before it builds any request or the model
-   * catalog the selector renders; `modelErrors` was added there in
-   * `@deepseek-ai/dsh-llm-pi-ai@0.1.5-rc.1`, and an absent map fails the entire
-   * route with "Cannot read properties of undefined (reading 'get')". This
-   * package's pinned peers predate that release, so nothing else in the build
-   * can observe the field going missing.
+   * `@deepseek-ai/dsh-llm-pi-ai@0.1.7-rc.2` declares both maps as REQUIRED on
+   * `ResolvedPiAiProviderProfile` (`lib/types/config.d.ts:172` `modelErrors`
+   * and `:178` `configuredMaxTokens`), so their absence is now a compile error
+   * as well as a runtime failure. The seam dereferences them before it builds
+   * any request or the model catalog the selector renders, where an absent map
+   * fails the entire route with "Cannot read properties of undefined (reading
+   * 'get')". This test pins the runtime values, which the type alone cannot.
    */
   it('carries every adapter-owned collection the seam reads unconditionally', () => {
     const profile = providerProfileOf(resolveConfig({

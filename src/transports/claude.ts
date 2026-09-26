@@ -28,6 +28,70 @@ export const CLAUDE_CODE_BETAS = [
   'fallback-credit-2026-06-01',
 ] as const
 
+/**
+ * Beta flags a model's own compatibility declaration requires, each paired with
+ * the condition under which pi-ai acts on that capability.
+ *
+ * This table exists because pi-ai's own beta assembly becomes unreachable the
+ * moment a caller supplies an `anthropic-beta` header: `getBetaFeatures`
+ * (`@earendil-works/pi-ai/dist/api/anthropic-messages.js:740-757`) returns the
+ * configured value VERBATIM and never evaluates its conditions. Every flag
+ * pi-ai would have derived from `model.compat` therefore has to be restated
+ * here, or the request advertises a capability's body without its header.
+ *
+ * The list is exhaustive for the compat-gated flags: the two remaining pi-ai
+ * defaults cannot fire on this route — `fine-grained-tool-streaming` needs
+ * `supportsEagerToolInputStreaming === false` (`:1105-1106`, and pi-ai's compat
+ * default is `true`), and `oauth-2025-04-20` is pushed only for an OAuth token
+ * while supplying `options.client` pins `isOAuth` false (`:357-360`).
+ */
+type AnthropicCompat = NonNullable<Model<'anthropic-messages'>['compat']>
+
+const COMPAT_BETAS: ReadonlyArray<{ when: (compat: AnthropicCompat) => boolean; betas: readonly string[] }> = [
+  {
+    // pi-ai both sends these and transforms the body with them, inserting
+    // thinking-level messages selected by model provider.
+    when: compat => compat.supportsMidConvoEffort === true,
+    betas: ['mid-conversation-output-config-2026-07-01', 'thinking-binding-controls-2026-08-01'],
+  },
+  {
+    // pi-ai writes `params.fallbacks` from this same list, which the endpoint
+    // rejects unless the server-side fallback beta authorizes it.
+    when: compat => (compat.allowedFallbackModels?.length ?? 0) > 0,
+    betas: ['server-side-fallback-2026-07-01'],
+  },
+]
+
+/**
+ * The complete `anthropic-beta` feature list for one model: the curated Claude
+ * Code set, every flag that model's compatibility declaration requires, and any
+ * feature the caller explicitly asked for (a route's configured `headers`).
+ * @param model - the resolved pi-ai model about to be called.
+ * @param extra - caller-supplied feature names, appended verbatim.
+ * @returns the ordered, de-duplicated feature list.
+ */
+export function betaFeaturesOf(model: Model<Api>, extra: readonly string[] = []): string[] {
+  const compat = (model as Model<'anthropic-messages'>).compat
+  return [...new Set<string>([
+    ...CLAUDE_CODE_BETAS,
+    ...(compat === undefined ? [] : COMPAT_BETAS.flatMap(entry => entry.when(compat) ? entry.betas : [])),
+    ...extra,
+  ])]
+}
+
+/**
+ * Split one caller-supplied `anthropic-beta` header value into feature names.
+ * @param headers - the route's configured request headers, if any.
+ * @returns the declared features, in order, without blanks.
+ */
+export function requestedBetas(headers: ProviderHeaders | undefined): string[] {
+  return Object.entries(headers ?? {})
+    .filter(([name]) => name.toLowerCase() === 'anthropic-beta')
+    .flatMap(([, value]) => (typeof value === 'string' ? value.split(',') : []))
+    .map(feature => feature.trim())
+    .filter(feature => feature.length > 0)
+}
+
 const BILLING_IDENTITY = `x-anthropic-billing-header: cc_version=${CLAUDE_CODE_VERSION}.f32; cc_entrypoint=sdk-cli;`
 const AGENT_IDENTITY = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 
@@ -123,6 +187,8 @@ function createClient(
   apiKey: string,
   sessionId: string | undefined,
   headers: ProviderHeaders | undefined,
+  betas: readonly string[],
+  send: typeof globalThis.fetch,
 ): Anthropic {
   const attribution = typeof headers?.['user-agent'] === 'string' ? ` ${headers['user-agent']}` : ''
   return new Anthropic({
@@ -133,13 +199,16 @@ function createClient(
     defaultHeaders: {
       ...headers,
       accept: 'application/json',
-      'anthropic-beta': CLAUDE_CODE_BETAS.join(','),
+      // Kept for the request the SDK builds outside pi-ai's own beta assembly.
+      // The authoritative copy is `betas`, forwarded through the request
+      // options below, because pi-ai rebuilds the header from there.
+      'anthropic-beta': betas.join(','),
       'anthropic-dangerous-direct-browser-access': 'true',
       'user-agent': `claude-cli/${CLAUDE_CODE_VERSION} (external, sdk-cli)${attribution}`,
       'x-app': 'cli',
       ...sessionId === undefined ? {} : { 'x-claude-code-session-id': sessionId },
     },
-    fetch: (input, init) => fetch(appendBetaQuery(input), init),
+    fetch: (input, init) => send(appendBetaQuery(input), init),
   })
 }
 
@@ -224,6 +293,7 @@ function runClaude(
   model: Model<Api>,
   context: Context,
   options: SimpleStreamOptions | undefined,
+  send: typeof globalThis.fetch,
 ): AsyncIterable<AssistantMessageEvent> {
   const apiKey = options?.apiKey
   if (apiKey === undefined || apiKey.trim().length === 0) throw new Error('No API key for provider: anyrouter')
@@ -237,9 +307,17 @@ function runClaude(
     ? undefined
     : Math.min(budgetOf(reasoning), Math.max(0, requestedMaxTokens - 1_024))
   const thinkingEnabled = reasoning !== undefined && (adaptive || (thinkingBudget ?? 0) >= 1_024)
+  // pi-ai reconstructs `anthropic-beta` from `model.headers` and
+  // `options.headers` alone (`getBetaFeatures` in
+  // `@earendil-works/pi-ai/dist/api/anthropic-messages.js:740-757`) and hands
+  // the result to the SDK's `betas` parameter, which REPLACES any
+  // `anthropic-beta` on the client's default headers. The curated Claude Code
+  // set therefore has to ride the request options to survive.
+  const betas = betaFeaturesOf(model, requestedBetas(headers))
   const anthropicOptions: AnthropicOptions = {
     ...baseOptions,
-    client: createClient(model, apiKey, options?.sessionId, headers),
+    client: createClient(model, apiKey, options?.sessionId, headers, betas, send),
+    headers: { ...headers, 'anthropic-beta': betas.join(',') },
     thinkingDisplay: 'omitted',
     maxRetries: 0,
     thinkingEnabled,
@@ -259,11 +337,33 @@ function runClaude(
   return restoredEvents(events, mapped.fromWire)
 }
 
-export const claudeCodeStreams: ProviderStreams = {
-  stream(model: Model<Api>, context: Context, options?: StreamOptions) {
-    return runClaude(model, context, options as SimpleStreamOptions | undefined) as ReturnType<ProviderStreams['stream']>
-  },
-  streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions) {
-    return runClaude(model, context, options) as ReturnType<ProviderStreams['streamSimple']>
-  },
+/**
+ * Build the Claude Code transport for one route.
+ *
+ * The `fetch` is resolved per request rather than captured once, so a live
+ * settings edit that changes the proxy URL takes effect on the next request
+ * without remounting the plugin. A route that configures no proxy receives the
+ * global `fetch`, which is what every release before this seam used.
+ * @param resolveFetch - supplies the `fetch` this route must send with.
+ * @returns the stream functions pi-ai's provider registry expects.
+ */
+export function createClaudeCodeStreams(
+  resolveFetch: () => typeof globalThis.fetch = () => globalThis.fetch,
+): ProviderStreams {
+  return {
+    stream(model: Model<Api>, context: Context, options?: StreamOptions) {
+      return runClaude(
+        model,
+        context,
+        options as SimpleStreamOptions | undefined,
+        resolveFetch(),
+      ) as ReturnType<ProviderStreams['stream']>
+    },
+    streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions) {
+      return runClaude(model, context, options, resolveFetch()) as ReturnType<ProviderStreams['streamSimple']>
+    },
+  }
 }
+
+/** The direct-connection transport: the route with no proxy configured. */
+export const claudeCodeStreams: ProviderStreams = createClaudeCodeStreams()

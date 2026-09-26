@@ -22,6 +22,7 @@ export default defineConfig({
       '@deepseek-ai/dsh-timeout',
       '@deepseek-ai/schemastery',
       '@earendil-works/pi-ai',
+      'undici',
     ],
   },
 })

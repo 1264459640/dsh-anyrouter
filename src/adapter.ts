@@ -1,12 +1,13 @@
 import { createProvider, type Api, type Model, type Provider } from '@earendil-works/pi-ai'
-import { PiAiAdapter, type ResolvedPiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai'
+import { PiAiAdapter, type PiAiAdapterOptions, type ResolvedPiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import type { ResolvedConfig } from './config.ts'
 import { effectiveReasoning, resolveModel } from './catalog.ts'
-import { claudeCodeStreams } from './transports/claude.ts'
-import { codexResponsesStreams } from './transports/codex.ts'
+import { proxyFetch } from './proxy-transport.ts'
+import { createClaudeCodeStreams } from './transports/claude.ts'
+import { createCodexResponsesStreams } from './transports/codex.ts'
 
 const ambientAuth = {
   apiKey: {
@@ -21,6 +22,12 @@ const ambientAuth = {
 
 function providerOf(config: ResolvedConfig): Provider {
   const models: Model<Api>[] = config.models.map(model => resolveModel(model, config.baseURL))
+  // Both transports resolve their `fetch` per request from this closure, so the
+  // proxy is read from the *current* resolved config rather than captured at
+  // provider-construction time — a live settings edit reaches the next request
+  // without remounting the route. `proxyFetch(undefined)` is the global `fetch`,
+  // so an unproxied route is byte-for-byte the pre-proxy behaviour.
+  const resolveFetch = (): typeof globalThis.fetch => proxyFetch(config.proxy)
   return createProvider({
     id: 'anyrouter',
     name: 'AnyRouter',
@@ -28,21 +35,21 @@ function providerOf(config: ResolvedConfig): Provider {
     auth: ambientAuth,
     models,
     api: {
-      'anthropic-messages': claudeCodeStreams,
-      'openai-responses': codexResponsesStreams,
+      'anthropic-messages': createClaudeCodeStreams(resolveFetch),
+      'openai-responses': createCodexResponsesStreams(resolveFetch),
     },
   })
 }
 
 /**
- * The resolved profile this route hands the seam. `modelErrors` is
- * adapter-owned and dereferenced before every request and every model-catalog
- * projection, but the Host only introduced it in
- * `@deepseek-ai/dsh-llm-pi-ai@0.1.5-rc.1`; this package's pinned peers predate
- * that release, so the field is declared here instead of inherited. Older Hosts
- * ignore the extra key, so one profile shape serves both.
+ * The resolved profile this route hands the seam. `modelErrors` and
+ * `configuredMaxTokens` are adapter-owned and dereferenced before every
+ * request and every model-catalog projection; the seam requires both, so the
+ * alias now only names the Host's own type rather than widening it. Older
+ * Hosts that predate the maps ignore the extra keys, so one profile shape
+ * serves every supported release.
  */
-export type HostResolvedProfile = ResolvedPiAiProviderProfile & { modelErrors: ReadonlyMap<string, string> }
+export type HostResolvedProfile = ResolvedPiAiProviderProfile
 
 /**
  * The single resolved profile this route publishes to the seam. Exported for
@@ -92,7 +99,7 @@ export class AnyRouterAdapter extends PiAiAdapter {
       snapshotProfiles = new Map([['anyrouter', providerProfileOf(config)]])
       return snapshotProfiles
     }
-    const auth = {
+    const auth: PiAiAdapterOptions['auth'] = {
       credentials: {
         read: () => Promise.resolve(undefined),
         list: () => Promise.resolve([]),
