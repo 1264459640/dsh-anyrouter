@@ -11,6 +11,7 @@ import { AnyRouterAdapter } from './adapter.ts'
 import {
   PROVIDER,
   SETTINGS_NS,
+  normalizeBaseURL,
   plainOptions,
   resolveConfig,
   type Config as AnyRouterConfig,
@@ -198,9 +199,20 @@ export function apply(ctx: Context, config: AnyRouterConfig): void {
 
   ctx.llm.registerModelDiscovery(SETTINGS_NS, async (request, signal) => {
     const resolved = options()
+    const draft = request.baseURL?.trim()
+    const baseURL = draft ? normalizeBaseURL(draft) : resolved.baseURL
+    // The stored credential is only ever sent to the endpoint it was saved
+    // for. A draft endpoint must bring its own key, otherwise a caller could
+    // exfiltrate the stored key simply by pointing discovery elsewhere.
+    if (request.apiKey === undefined && baseURL !== resolved.baseURL) {
+      throw new LlmError(
+        'dsh-anyrouter: save the endpoint before syncing models, or supply an API key for the new endpoint',
+        'INVALID_CREDENTIAL',
+      )
+    }
     const apiKey = request.apiKey ?? await resolveApiKey(resolved.apiKeyEnv)
     return discoverAnyRouterModels({
-      baseURL: request.baseURL?.trim() || resolved.baseURL,
+      baseURL,
       apiKey,
       // Discovery talks to the same endpoint the route does, so it tunnels
       // through the same proxy. The `remote.llm.discoverModels` call carries the

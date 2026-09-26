@@ -8,7 +8,7 @@ import {
   type RetryPolicyConfig,
 } from '@deepseek-ai/dsh-llm'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
-import { normalizeProxyURL } from './proxy.ts'
+import { isLoopbackHost, normalizeProxyURL } from './proxy.ts'
 
 export const PROVIDER = 'anyrouter'
 /**
@@ -184,9 +184,7 @@ export function normalizeBaseURL(raw: string | undefined): string {
   if (parsed.search.length > 0 || parsed.hash.length > 0) {
     throw new Error('dsh-anyrouter: baseURL must not contain a query or fragment')
   }
-  const loopback = parsed.hostname === 'localhost'
-    || parsed.hostname === '127.0.0.1'
-    || parsed.hostname === '[::1]'
+  const loopback = isLoopbackHost(parsed.hostname)
   if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && loopback)) {
     throw new Error('dsh-anyrouter: baseURL must use https (http is allowed only for loopback development)')
   }

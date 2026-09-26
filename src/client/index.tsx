@@ -478,6 +478,9 @@ function Section({ ops, scope, subscribeCredentials }: SectionProps): ReactEleme
       // but has no field for a draft proxy, so the Host would still tunnel
       // through the previously saved value. Persisting it here is what makes
       // "paste proxy, press 同步模型" work in one step.
+      // The endpoint is saved too: the Host only sends the stored key to the
+      // saved endpoint, never to an unsaved draft.
+      await persistBaseURL(operation)
       await persistProxy(operation)
       const discovered = await ops.discoverModels(baseURL.trim() || DEFAULT_BASE_URL)
       if (!operation.active()) return
