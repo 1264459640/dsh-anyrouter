@@ -32,7 +32,7 @@ test('parseArgs defaults to install on the web profile with the pinned source', 
   assert.equal(options.command, 'install')
   assert.equal(options.profile, 'web')
   assert.equal(options.source, DEFAULT_SOURCE)
-  assert.equal(DEFAULT_SOURCE, `github:shaomingbo/${PACKAGE_NAME}#v${packageVersion}`)
+  assert.equal(DEFAULT_SOURCE, `github:1264459640/${PACKAGE_NAME}#v${packageVersion}`)
   assert.throws(() => parseArgs(['--profile']), /require values/)
   assert.throws(() => parseArgs(['--source']), /require values/)
   assert.throws(() => parseArgs(['bogus']), /unknown argument/)
