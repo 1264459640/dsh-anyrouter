@@ -1,15 +1,40 @@
+import { getCurrentSystemPrompt, normalizeContext } from '@earendil-works/pi-ai'
 import { streamSimple as openAIResponsesStreamSimple } from '@earendil-works/pi-ai/api/openai-responses'
 import type {
   Api,
   AssistantMessageEvent,
-  Context,
   Model,
   ProviderStreams,
   SimpleStreamOptions,
   StreamOptions,
+  TranscriptContext,
 } from '@earendil-works/pi-ai'
+import { codexHeaders } from './headers.ts'
 
-const CODEX_VERSION = '0.114.0'
+/**
+ * The Codex CLI release this transport reproduces.
+ *
+ * As on the Claude side, the plugin owns this value and it is deliberately NOT
+ * a configuration field: a user-chosen version string claims a generation whose
+ * request shape nobody can match from the settings page.
+ * `scripts/check-cli-versions.mjs` reports when a newer release exists.
+ */
+export const CODEX_VERSION = '0.159.3'
+
+/**
+ * The per-route fact the Codex Responses transport cannot read off the model:
+ * the route id it answers as. One bundle instance may serve several relays at
+ * once, and each has its own route id, so it is not a module constant.
+ *
+ * Nothing about the client IDENTITY lives here — see `./headers.ts`.
+ */
+export interface CodexTransportOptions {
+  /** Provider route id this transport belongs to; replaces the bundle default. */
+  providerId?: string
+}
+
+/** The route id used when a caller builds a transport without naming one. */
+const DEFAULT_TRANSPORT_PROVIDER = 'anyrouter'
 
 function compatiblePayload(payload: unknown, systemPrompt: string | undefined): unknown {
   if (typeof payload !== 'object' || payload === null) return payload
@@ -36,49 +61,70 @@ function compatiblePayload(payload: unknown, systemPrompt: string | undefined): 
   }
 }
 
-function nativeContext(context: Context): Context {
-  return {
-    ...context,
+/**
+ * The prompt the transcript currently carries, in the shape {@link compatiblePayload}
+ * expects: `undefined` when there is no system message at all.
+ *
+ * pi-ai 0.87 removed the flat `Context.systemPrompt`, so the prompt is read back
+ * out of the transcript with `getCurrentSystemPrompt`, which replays the system
+ * messages into the current prompt. For the single folded system message pi-ai's
+ * `Models.streamSimple` produces, that is exactly the pre-0.87 `systemPrompt`.
+ * The helper reports an absent prompt as `""`, while the rewrite below
+ * distinguishes `undefined` (fall back to the response's own instructions) from
+ * an empty string, so the empty replay is mapped back to `undefined` to keep the
+ * payload byte-identical.
+ */
+function currentSystemPrompt(context: TranscriptContext): string | undefined {
+  const prompt = getCurrentSystemPrompt(context.messages)
+  return prompt.length === 0 ? undefined : prompt
+}
+
+function nativeContext(context: TranscriptContext): TranscriptContext {
+  // Re-brand without re-folding: `normalizeContext` creates a leading system
+  // message only from its `systemPrompt`/`tools` arguments, and neither is
+  // passed here, so it returns this message list unchanged. The single system
+  // message pi-ai already folded upstream therefore stays the only one and no
+  // second prompt or tool declaration can be prepended.
+  return normalizeContext({
     messages: context.messages.map(message => message.role === 'assistant'
       ? { ...message, provider: 'openai-codex' }
       : message),
-  }
+  })
 }
 
-function restoreProvider(value: unknown): void {
+function restoreProvider(value: unknown, providerId: string): void {
   if (typeof value !== 'object' || value === null) return
   const record = value as Record<string, unknown>
-  if (record.provider === 'openai-codex') record.provider = 'anyrouter'
+  if (record.provider === 'openai-codex') record.provider = providerId
   for (const key of ['content', 'partial', 'message', 'error']) {
     const child = record[key]
-    if (Array.isArray(child)) child.forEach(restoreProvider)
-    else restoreProvider(child)
+    if (Array.isArray(child)) child.forEach(entry => restoreProvider(entry, providerId))
+    else restoreProvider(child, providerId)
   }
 }
 
-async function* restoredEvents(events: AsyncIterable<AssistantMessageEvent>): AsyncGenerator<AssistantMessageEvent> {
+async function* restoredEvents(
+  events: AsyncIterable<AssistantMessageEvent>,
+  providerId: string,
+): AsyncGenerator<AssistantMessageEvent> {
   for await (const event of events) {
-    restoreProvider(event)
+    restoreProvider(event, providerId)
     yield event
   }
 }
 
 function runCodex(
   model: Model<Api>,
-  context: Context,
+  context: TranscriptContext,
   options: SimpleStreamOptions | undefined,
   send: typeof globalThis.fetch,
+  transport: CodexTransportOptions,
 ): AsyncIterable<AssistantMessageEvent> {
-  const attribution = typeof options?.headers?.['user-agent'] === 'string'
-    ? ` ${options.headers['user-agent']}`
-    : ''
-  const headers = {
-    ...options?.headers,
-    accept: 'text/event-stream',
-    'openai-beta': 'responses=experimental',
-    'user-agent': `codex_cli_rs/${CODEX_VERSION}${attribution}`,
-    originator: 'codex_cli_rs',
-  }
+  const providerId = transport.providerId ?? DEFAULT_TRANSPORT_PROVIDER
+  // Resolved from the incoming transcript, before `nativeContext` re-brands it;
+  // that rewrite only restates an assistant message's `provider`, so the prompt
+  // is the same either way.
+  const systemPrompt = currentSystemPrompt(context)
   const nativeModel = { ...model, provider: 'openai-codex' } as Model<'openai-responses'>
   const events = openAIResponsesStreamSimple(nativeModel, nativeContext(context), {
     ...options,
@@ -89,41 +135,57 @@ function runCodex(
     // therefore enough to tunnel this transport without touching the global
     // dispatcher the OpenAI SDK would otherwise resolve.
     fetch: send,
-    headers,
+    // The complete Codex CLI identity, from the one table that owns it.
+    headers: codexHeaders({
+      version: CODEX_VERSION,
+      sessionId: options?.sessionId,
+      overrides: options?.headers,
+    }),
     maxRetries: 0,
     onPayload: async (payload) => {
-      const compatible = compatiblePayload(payload, context.systemPrompt)
+      const compatible = compatiblePayload(payload, systemPrompt)
       return options?.onPayload === undefined
         ? compatible
         : (await options.onPayload(compatible, model)) ?? compatible
     },
   })
-  return restoredEvents(events)
+  return restoredEvents(events, providerId)
 }
 
 /**
  * Build the Codex Responses transport for one route.
  *
  * Mirrors {@link createClaudeCodeStreams}: the `fetch` is resolved per request
- * so a live proxy edit applies to the next request, and a route with no proxy
- * gets the global `fetch` exactly as before.
+ * so a live proxy edit applies to the next request, a route with no proxy gets
+ * the global `fetch` exactly as before, and `transport` supplies the identity
+ * this particular route answers as — which is what lets one bundle serve
+ * several relays without sharing a `user-agent`.
  * @param resolveFetch - supplies the `fetch` this route must send with.
+ * @param transport - the owning provider's route id and version override.
  * @returns the stream functions pi-ai's provider registry expects.
  */
 export function createCodexResponsesStreams(
   resolveFetch: () => typeof globalThis.fetch = () => globalThis.fetch,
+  transport: CodexTransportOptions = {},
 ): ProviderStreams {
   return {
-    stream(model: Model<Api>, context: Context, options?: StreamOptions) {
+    stream(model: Model<Api>, context: TranscriptContext, options?: StreamOptions) {
       return runCodex(
         model,
         context,
         options as SimpleStreamOptions | undefined,
         resolveFetch(),
+        transport,
       ) as ReturnType<ProviderStreams['stream']>
     },
-    streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions) {
-      return runCodex(model, context, options, resolveFetch()) as ReturnType<ProviderStreams['streamSimple']>
+    streamSimple(model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) {
+      return runCodex(
+        model,
+        context,
+        options,
+        resolveFetch(),
+        transport,
+      ) as ReturnType<ProviderStreams['streamSimple']>
     },
   }
 }

@@ -52,10 +52,12 @@ describe('reasoning profile round-trip', () => {
     const source = [...byId.values()]
     expect(source).toHaveLength(byId.size)
     const first = resolveConfig({ models: source })
-    const second = resolveConfig({ models: first.models.map(model => ({ ...model })) })
-    expect(second.models).toEqual(first.models)
-    expect(second.retryPolicy).toEqual(first.retryPolicy)
-    expect(second.baseURL).toBe(first.baseURL)
+    const firstProvider = first.providers[0]!
+    const second = resolveConfig({ models: firstProvider.models.map(model => ({ ...model })) })
+    const secondProvider = second.providers[0]!
+    expect(secondProvider.models).toEqual(firstProvider.models)
+    expect(secondProvider.retryPolicy).toEqual(firstProvider.retryPolicy)
+    expect(secondProvider.baseURL).toBe(firstProvider.baseURL)
   })
 
   it('keeps canonical effort order, the persisted default, and the disabled collapse', () => {
@@ -65,8 +67,8 @@ describe('reasoning profile round-trip', () => {
         { id: 'claude-opus-6', protocol: 'claude-code', reasoning: { disabled: true, efforts: ['low'], defaultEffort: 'low' } },
       ],
     })
-    expect(resolved.models[0]?.reasoning).toEqual({ efforts: ['low', 'high', 'max'], defaultEffort: 'high' })
-    expect(resolved.models[1]?.reasoning).toEqual({ disabled: true })
+    expect(resolved.providers[0]!.models[0]?.reasoning).toEqual({ efforts: ['low', 'high', 'max'], defaultEffort: 'high' })
+    expect(resolved.providers[0]!.models[1]?.reasoning).toEqual({ disabled: true })
   })
 
   it('rejects a default outside the effort set and an adaptive codex profile', () => {

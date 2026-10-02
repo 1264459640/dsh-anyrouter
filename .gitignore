@@ -1,4 +1,7 @@
 node_modules/
+.pnpm-store/
+.recon/
+.acl-reports/
 *.tgz
 *.tmp
 .DS_Store

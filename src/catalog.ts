@@ -1,6 +1,6 @@
 import type { Api, Model } from '@earendil-works/pi-ai'
 import { MODEL_PROFILES_BY_ID, type GeneratedModelProfile } from './model-profiles.generated.ts'
-import { REASONING_LEVELS, type AnyRouterModelConfig, type AnyRouterProtocol, type ReasoningLevel } from './config.ts'
+import { PROVIDER, REASONING_LEVELS, type AnyRouterModelConfig, type AnyRouterProtocol, type ReasoningLevel } from './config.ts'
 
 const FALLBACK_CONTEXT: Record<AnyRouterProtocol, number> = {
   'claude-code': 1_000_000,
@@ -78,7 +78,21 @@ function referenceProfile(id: string): GeneratedModelProfile | undefined {
   return MODEL_PROFILES_BY_ID.get(id)
 }
 
-export function resolveModel(config: AnyRouterModelConfig, baseURL: string): Model<Api> {
+/**
+ * Project one synchronized model into the pi-ai descriptor the transports and
+ * the seam both read.
+ *
+ * `providerId` is the route this model belongs to, and it is why this function
+ * takes one: a bundle may now serve several relays, and a model's `provider`
+ * field is what routes the request — and what the seam matches against its
+ * profiles map. It defaults to the migrated legacy route so a hand-built call
+ * keeps answering as it always did.
+ * @param config - the persisted model row.
+ * @param baseURL - the owning provider's endpoint.
+ * @param providerId - the owning provider's route id.
+ * @returns the resolved pi-ai model.
+ */
+export function resolveModel(config: AnyRouterModelConfig, baseURL: string, providerId: string = PROVIDER): Model<Api> {
   const reference = referenceProfile(config.id)
   const api = config.protocol === 'claude-code' ? 'anthropic-messages' : 'openai-responses'
   const reasoning = effectiveReasoning(config)
@@ -94,7 +108,7 @@ export function resolveModel(config: AnyRouterModelConfig, baseURL: string): Mod
     id: config.id,
     name: config.name ?? reference?.name ?? config.id,
     api,
-    provider: 'anyrouter',
+    provider: providerId,
     baseUrl: config.protocol === 'codex-responses' ? `${baseURL}/v1` : baseURL,
     reasoning: reasoning.enabled,
     input: ['text', 'image'],

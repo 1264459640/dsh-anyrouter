@@ -13,7 +13,7 @@
 // as a transport-contract regression.
 
 import { describe, expect, it } from 'vitest'
-import type { AssistantMessageEvent, Context } from '@earendil-works/pi-ai'
+import { normalizeContext, type AssistantMessageEvent, type TranscriptContext } from '@earendil-works/pi-ai'
 import { DEFAULT_BASE_URL } from '../src/config.ts'
 import { resolveModel } from '../src/catalog.ts'
 import { discoverAnyRouterModels } from '../src/discovery.ts'
@@ -28,14 +28,20 @@ function isCapacityFailure(message: string): boolean {
   return /负载已经达到上限|Service Unavailable|rate.?limit|上游负载|请稍后重试/i.test(message)
 }
 
-function userContext(text: string): Context {
-  return {
+/**
+ * The transport entry points are pi-ai provider stream functions, so since
+ * pi-ai 0.87 they take a branded `TranscriptContext`. Building the request
+ * through `normalizeContext` is what pi-ai's own `Models.streamSimple` does, and
+ * with no `systemPrompt`/`tools` it leaves the message list as-is.
+ */
+function userContext(text: string): TranscriptContext {
+  return normalizeContext({
     messages: [{
       role: 'user',
       timestamp: Date.now(),
       content: [{ type: 'text', text }],
     }],
-  }
+  })
 }
 
 async function collectText(

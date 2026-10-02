@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { AssistantMessageEvent, Context } from '@earendil-works/pi-ai'
+import { normalizeContext, type AssistantMessageEvent, type Context } from '@earendil-works/pi-ai'
 import { resolveModel } from '../src/catalog.ts'
-import { claudeCodeStreams } from '../src/transports/claude.ts'
-import { codexResponsesStreams } from '../src/transports/codex.ts'
+import { betaFeaturesOf, claudeCodeStreams, CLAUDE_CODE_VERSION } from '../src/transports/claude.ts'
+import { codexResponsesStreams, CODEX_VERSION } from '../src/transports/codex.ts'
+import { ANTHROPIC_API_VERSION, CODEX_ORIGINATOR, hostDescriptor } from '../src/transports/headers.ts'
 
 const originalFetch = globalThis.fetch
 
@@ -43,7 +44,7 @@ describe('Claude Code compatibility transport', () => {
       tools: [{ name: 'read', description: 'Read a file', parameters: { type: 'object', properties: {} } }],
     }
 
-    const events = await collect(claudeCodeStreams.streamSimple(model, context, {
+    const events = await collect(claudeCodeStreams.streamSimple(model, normalizeContext(context), {
       apiKey: 'sk-test',
       reasoning: 'high',
       maxTokens: 64,
@@ -56,7 +57,18 @@ describe('Claude Code compatibility transport', () => {
     expect(request!.url).toBe('https://anyrouter.top/v1/messages?beta=true')
     expect(request!.headers.get('authorization')).toBe('Bearer sk-test')
     expect(request!.headers.get('anthropic-beta')).toContain('context-1m-2025-08-07')
-    expect(request!.headers.get('user-agent')).toContain('deepseek-harness/test')
+    // The COMPLETE Claude Code identity, asserted exactly: a partial set is the
+    // failure mode this transport exists to avoid, and an exact user-agent also
+    // catches a header being concatenated with the SDK's own rather than
+    // replaced by ours.
+    expect(request!.headers.get('user-agent')).toBe(`claude-cli/${CLAUDE_CODE_VERSION} (external, sdk-cli) deepseek-harness/test`)
+    expect(request!.headers.get('anthropic-version')).toBe(ANTHROPIC_API_VERSION)
+    expect(request!.headers.get('anthropic-dangerous-direct-browser-access')).toBe('true')
+    expect(request!.headers.get('x-app')).toBe('cli')
+    expect(request!.headers.get('accept')).toBe('application/json')
+    expect(request!.headers.get('content-type')).toContain('application/json')
+    expect(request!.headers.get('x-claude-code-session-id')).toBe('session-1')
+    expect(request!.headers.get('x-client-request-id')).toBe('session-1')
     const body = JSON.parse(await request!.text())
     expect(body.model).toBe('claude-opus-5')
     expect(body.system.some((block: any) => String(block.text).includes('Claude Agent SDK'))).toBe(true)
@@ -77,9 +89,9 @@ describe('Claude Code compatibility transport', () => {
       return new Response(claudeSse(), { status: 200, headers: { 'content-type': 'text/event-stream' } })
     }) as typeof fetch
     const model = resolveModel({ id: 'claude-opus-4-1-20250805', protocol: 'claude-code' }, 'https://anyrouter.top')
-    await collect(claudeCodeStreams.streamSimple(model, {
+    await collect(claudeCodeStreams.streamSimple(model, normalizeContext({
       messages: [{ role: 'user', content: 'Reply OK', timestamp: 0 }],
-    }, { apiKey: 'sk-test', reasoning: 'high', maxTokens: 2_048 }))
+    }), { apiKey: 'sk-test', reasoning: 'high', maxTokens: 2_048 }))
     const body = JSON.parse(await request!.text())
     expect(body.max_tokens).toBe(2_048)
     expect(body.thinking).toMatchObject({ type: 'enabled', budget_tokens: 1_024 })
@@ -102,10 +114,11 @@ describe('Codex Responses compatibility transport', () => {
       messages: [{ role: 'user', content: 'Reply OK', timestamp: 0 }],
     }
 
-    const events = await collect(codexResponsesStreams.streamSimple(model, context, {
+    const events = await collect(codexResponsesStreams.streamSimple(model, normalizeContext(context), {
       apiKey: 'sk-test',
       reasoning: 'high',
       maxTokens: 64,
+      sessionId: 'session-1',
       headers: { 'user-agent': 'deepseek-harness/test' },
     }))
 
@@ -113,11 +126,22 @@ describe('Codex Responses compatibility transport', () => {
     expect(request).toBeDefined()
     expect(request!.url).toBe('https://anyrouter.top/v1/responses')
     expect(request!.headers.get('authorization')).toBe('Bearer sk-test')
-    expect(request!.headers.get('originator')).toBe('codex_cli_rs')
+    // The COMPLETE Codex CLI identity, asserted exactly.
+    expect(request!.headers.get('originator')).toBe(CODEX_ORIGINATOR)
     expect(request!.headers.get('accept')).toBe('text/event-stream')
-    expect(request!.headers.get('openai-beta')).toBe('responses=experimental')
-    expect(request!.headers.get('user-agent')).toContain('codex_cli_rs/')
-    expect(request!.headers.get('user-agent')).toContain('deepseek-harness/test')
+    expect(request!.headers.get('content-type')).toContain('application/json')
+    expect(request!.headers.get('user-agent')).toBe(
+      `codex_cli_rs/${CODEX_VERSION} (${hostDescriptor()}) deepseek-harness/test`,
+    )
+    // Session headers: the shape the CLI's `build_session_headers` produces.
+    expect(request!.headers.get('session-id')).toBe('session-1')
+    expect(request!.headers.get('thread-id')).toBe('session-1')
+    expect(request!.headers.get('x-client-request-id')).toBe('session-1')
+    expect(request!.headers.get('x-codex-installation-id')).toMatch(/^[a-f0-9]{32}$/)
+    // The Responses API is GA in the generation this transport reproduces: the
+    // old beta gate is absent from `codex.exe`, so claiming it would assert a
+    // client that no longer exists.
+    expect(request!.headers.get('openai-beta')).toBeNull()
     const body = JSON.parse(await request!.text())
     expect(body).toMatchObject({
       model: 'gpt-5.6-sol',
@@ -153,11 +177,65 @@ describe('Codex Responses compatibility transport', () => {
       ],
       tools: [{ name: 'bash', description: 'Run', parameters: { type: 'object', properties: { command: { type: 'string' } } } }],
     } as Context
-    await collect(codexResponsesStreams.streamSimple(model, context, { apiKey: 'sk-test' }))
+    await collect(codexResponsesStreams.streamSimple(model, normalizeContext(context), { apiKey: 'sk-test' }))
     const body = JSON.parse(await request!.text())
     const call = body.input.find((item: any) => item.type === 'function_call')
     const result = body.input.find((item: any) => item.type === 'function_call_output')
     expect(call).toMatchObject({ call_id: 'call_1', id: 'fc_1' })
     expect(result).toMatchObject({ call_id: 'call_1' })
+  })
+})
+
+/**
+ * `COMPAT_BETAS` restates the betas pi-ai would derive itself, because a
+ * caller-supplied `anthropic-beta` makes pi-ai's own assembly return the value
+ * verbatim instead of evaluating its conditions. pi-ai 0.87 added a
+ * transcript-shaped condition for native tool changes
+ * (`@earendil-works/pi-ai/dist/api/anthropic-messages.js:801-804`), so these
+ * cases pin the replication of it.
+ *
+ * This is worth a test of its own because the failure is silent and reachable
+ * by a routine catalog regeneration: the generated table can switch the gate on
+ * for models this route already serves, and the request then carries a
+ * `defer_loading` body with no beta authorizing it.
+ */
+describe('anthropic-beta restatement for native tool changes', () => {
+  const NATIVE_TOOL_CHANGES = 'mid-conversation-tool-changes-2026-07-01'
+  const readTool = { name: 'read', description: 'Read a file', parameters: { type: 'object', properties: {} } }
+  const model = (compat: Record<string, unknown>) => ({ id: 'claude-opus-5', compat }) as never
+  const transcript = (tools?: unknown[]) => normalizeContext({
+    messages: [{ role: 'user', content: 'hi', timestamp: 0 }],
+    ...(tools === undefined ? {} : { tools }),
+  } as Context)
+
+  it('adds the beta when both gates are set and a tool is initially declared', () => {
+    const compat = { supportsMidConvoSystemMessages: true, supportsMidConvoToolChanges: true }
+    expect(betaFeaturesOf(model(compat), transcript([readTool]))).toContain(NATIVE_TOOL_CHANGES)
+  })
+
+  it('omits the beta whenever pi-ai would not take its native-tool-changes branch', () => {
+    const both = { supportsMidConvoSystemMessages: true, supportsMidConvoToolChanges: true }
+    // pi-ai needs an initially declared tool to anchor the deferred ones.
+    expect(betaFeaturesOf(model(both), transcript())).not.toContain(NATIVE_TOOL_CHANGES)
+    // Each gate alone is not enough.
+    expect(betaFeaturesOf(model({ supportsMidConvoSystemMessages: true }), transcript([readTool])))
+      .not.toContain(NATIVE_TOOL_CHANGES)
+    expect(betaFeaturesOf(model({ supportsMidConvoToolChanges: true }), transcript([readTool])))
+      .not.toContain(NATIVE_TOOL_CHANGES)
+    // A model that declares no compat at all must stay clean.
+    expect(betaFeaturesOf(model({}), transcript([readTool]))).not.toContain(NATIVE_TOOL_CHANGES)
+  })
+
+  it('omits the beta when a tool name is redefined, which the block form cannot express', () => {
+    // Two system messages redeclare `read` with different schemas, so pi-ai's
+    // `hasToolRedefinitions` guard (`:801-804`) keeps its branch off and the
+    // beta must not be advertised on its behalf.
+    const redefined = normalizeContext({
+      systemPrompt: 'p',
+      tools: [readTool],
+      messages: [{ role: 'system', content: 'more', toolsAdded: [{ ...readTool, description: 'other' }], timestamp: 0 }],
+    } as Context)
+    const compat = { supportsMidConvoSystemMessages: true, supportsMidConvoToolChanges: true }
+    expect(betaFeaturesOf(model(compat), redefined)).not.toContain(NATIVE_TOOL_CHANGES)
   })
 })

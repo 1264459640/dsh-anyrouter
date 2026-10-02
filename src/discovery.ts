@@ -30,7 +30,7 @@ function modelURL(baseURL: string): string {
   return url.toString()
 }
 
-async function readBounded(response: Response, signal?: AbortSignal): Promise<string> {
+async function readBounded(response: Response, label: string, signal?: AbortSignal): Promise<string> {
   if (response.body === null) return ''
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
@@ -43,7 +43,7 @@ async function readBounded(response: Response, signal?: AbortSignal): Promise<st
       if (next.done) break
       bytes += next.value.byteLength
       if (bytes > MAX_RESPONSE_BYTES) {
-        throw new LlmError(`AnyRouter model listing exceeds ${MAX_RESPONSE_BYTES} bytes`, 'DISCOVERY_FAILED')
+        throw new LlmError(`${label} model listing exceeds ${MAX_RESPONSE_BYTES} bytes`, 'DISCOVERY_FAILED')
       }
       text += decoder.decode(next.value, { stream: true })
     }
@@ -54,22 +54,35 @@ async function readBounded(response: Response, signal?: AbortSignal): Promise<st
   }
 }
 
-function rowsOf(body: unknown): ModelRow[] {
+function rowsOf(body: unknown, label: string): ModelRow[] {
   if (typeof body !== 'object' || body === null || !Array.isArray((body as { data?: unknown }).data)) {
-    throw new LlmError('AnyRouter model listing is not an OpenAI-compatible data array', 'DISCOVERY_FAILED')
+    throw new LlmError(`${label} model listing is not an OpenAI-compatible data array`, 'DISCOVERY_FAILED')
   }
   return (body as { data: unknown[] }).data.filter((row): row is ModelRow => typeof row === 'object' && row !== null)
 }
 
+/**
+ * Interrogate one relay for the models it advertises.
+ *
+ * The name survives from the single-provider era but the function is not tied
+ * to it: `label` names the provider in every diagnostic, because with several
+ * relays configured a bare "model listing is not an OpenAI-compatible data
+ * array" would not say which endpoint misbehaved.
+ * @param options - endpoint, one-shot credential, cancellation and label.
+ * @returns the Claude/GPT models the endpoint reports, in endpoint order.
+ */
 export async function discoverAnyRouterModels(options: {
   baseURL: string
   apiKey: string
   signal?: AbortSignal
   fetch?: typeof fetch
+  /** Provider name for diagnostics; defaults to the migrated route's name. */
+  label?: string
 }): Promise<LlmDiscoveredModel[]> {
+  const label = options.label ?? 'AnyRouter'
   const keyCheck = normalizeApiKey(options.apiKey)
   if (!keyCheck.ok) {
-    throw new LlmError(`AnyRouter model discovery received an unusable API key (${keyCheck.reason})`, 'INVALID_CREDENTIAL')
+    throw new LlmError(`${label} model discovery received an unusable API key (${keyCheck.reason})`, 'INVALID_CREDENTIAL')
   }
   const key = keyCheck.value
   const url = modelURL(normalizeBaseURL(options.baseURL))
@@ -84,8 +97,8 @@ export async function discoverAnyRouterModels(options: {
       ...options.signal === undefined ? {} : { signal: options.signal },
     })
   } catch (cause) {
-    if (options.signal?.aborted) throw new LlmError('AnyRouter model discovery aborted', 'ABORTED', { cause })
-    throw new LlmError(`failed to fetch AnyRouter models from ${url}`, 'DISCOVERY_FAILED', { cause })
+    if (options.signal?.aborted) throw new LlmError(`${label} model discovery aborted`, 'ABORTED', { cause })
+    throw new LlmError(`failed to fetch ${label} models from ${url}`, 'DISCOVERY_FAILED', { cause })
   }
   if (!response.ok) {
     throw new LlmError(
@@ -95,10 +108,10 @@ export async function discoverAnyRouterModels(options: {
   }
   let text: string
   try {
-    text = await readBounded(response, options.signal)
+    text = await readBounded(response, label, options.signal)
   } catch (cause) {
-    if (options.signal?.aborted) throw new LlmError('AnyRouter model discovery aborted', 'ABORTED', { cause })
-    throw new LlmError(`failed to read AnyRouter models from ${url}`, 'DISCOVERY_FAILED', { cause })
+    if (options.signal?.aborted) throw new LlmError(`${label} model discovery aborted`, 'ABORTED', { cause })
+    throw new LlmError(`failed to read ${label} models from ${url}`, 'DISCOVERY_FAILED', { cause })
   }
   let body: unknown
   try {
@@ -109,7 +122,7 @@ export async function discoverAnyRouterModels(options: {
 
   const discovered: LlmDiscoveredModel[] = []
   const seen = new Set<string>()
-  for (const row of rowsOf(body)) {
+  for (const row of rowsOf(body, label)) {
     if (typeof row.id !== 'string' || row.id.length === 0 || seen.has(row.id)) continue
     const protocol = classifyProtocol(row.id)
     if (protocol === undefined) continue

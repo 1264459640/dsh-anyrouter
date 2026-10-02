@@ -1,6 +1,6 @@
 import { createServer, type Server } from 'node:http'
 import { afterEach, describe, expect, it } from 'vitest'
-import type { AssistantMessageEvent, Context } from '@earendil-works/pi-ai'
+import { normalizeContext, type AssistantMessageEvent, type Context } from '@earendil-works/pi-ai'
 import { resolveConfig } from '../src/config.ts'
 import { resolveModel } from '../src/catalog.ts'
 import { discoverAnyRouterModels } from '../src/discovery.ts'
@@ -137,9 +137,16 @@ describe('proxy setting validation', () => {
   })
 
   it('resolves the setting through the plugin configuration', () => {
-    expect(resolveConfig({}).proxy).toBeUndefined()
-    expect(resolveConfig({ proxy: 'http://127.0.0.1:7890' }).proxy).toBe('http://127.0.0.1:7890')
-    expect(() => resolveConfig({ proxy: 'socks5://127.0.0.1:7891' })).toThrow(/cannot tunnel through/)
+    expect(resolveConfig({}).providers[0]!.proxy).toBeUndefined()
+    expect(resolveConfig({ proxy: 'http://127.0.0.1:7890' }).providers[0]!.proxy).toBe('http://127.0.0.1:7890')
+    // A refused proxy DISABLES its provider rather than throwing: resolution has
+    // to stay total, or a half-typed proxy in the settings form could stop the
+    // plugin from mounting at all.
+    const socks = resolveConfig({ providers: [
+      { id: 'relay', baseURL: 'https://a.example.com', proxy: 'socks5://127.0.0.1:7891' },
+    ] })
+    expect(socks.providers[0]!.proxy).toBeUndefined()
+    expect(socks.providers[0]!.error).toMatch(/cannot tunnel through/)
   })
 })
 
@@ -214,7 +221,7 @@ describe('transports accept a route-bound fetch', () => {
     const model = resolveModel({ id: 'claude-opus-5', protocol: 'claude-code' }, 'https://anyrouter.top')
     const context: Context = { messages: [{ role: 'user', content: 'Reply OK', timestamp: 0 }] }
 
-    const events = await collect(streams.streamSimple(model, context, { apiKey: 'sk-test' }))
+    const events = await collect(streams.streamSimple(model, normalizeContext(context), { apiKey: 'sk-test' }))
 
     expect(events.some(event => event.type === 'done')).toBe(true)
     expect(request?.url).toBe('https://anyrouter.top/v1/messages?beta=true')
@@ -233,7 +240,7 @@ describe('transports accept a route-bound fetch', () => {
     const model = resolveModel({ id: 'gpt-5.6-sol', protocol: 'codex-responses' }, 'https://anyrouter.top')
     const context: Context = { messages: [{ role: 'user', content: 'Reply OK', timestamp: 0 }] }
 
-    const events = await collect(streams.streamSimple(model, context, { apiKey: 'sk-test' }))
+    const events = await collect(streams.streamSimple(model, normalizeContext(context), { apiKey: 'sk-test' }))
 
     expect(events.some(event => event.type === 'error')).toBe(true)
     // The fetch reached the OpenAI client pi-ai builds, which is the seam the

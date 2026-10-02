@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { AnyRouterAdapter, providerProfileOf } from '../src/adapter.ts'
-import { resolveConfig } from '../src/config.ts'
+import { resolveConfig, isUsable } from '../src/config.ts'
 import { MODEL_PROFILES_BY_ID } from '../src/model-profiles.generated.ts'
 
 function adapter() {
@@ -29,10 +29,12 @@ describe('AnyRouterAdapter catalog', () => {
       context: { contextWindow: 1_000_000 },
       reasoning: {
         // The selectable set is the GENERATED reference profile's own effort
-        // list, not a hand-written expectation: pi-ai 0.85.1's catalog changed
-        // which levels a given model supports (first-party Anthropic no longer
-        // advertises `off` for its adaptive models), so asserting a literal
-        // list here would pin the catalog, not this adapter's projection of it.
+        // list, not a hand-written expectation: pi-ai's own catalog decides
+        // which levels a given model supports, and it moves between releases
+        // (first-party Anthropic no longer advertises `off` for its adaptive
+        // models, and pi-ai 0.87 dropped `minimal` for the GPT-5.4 rows), so
+        // asserting a literal list here would pin the catalog, not this
+        // adapter's projection of it.
         efforts: MODEL_PROFILES_BY_ID.get('claude-opus-5')!.efforts
           .map(effort => expect.objectContaining({ id: effort })),
       },
@@ -93,9 +95,13 @@ describe('seam profile contract', () => {
    * 'get')". This test pins the runtime values, which the type alone cannot.
    */
   it('carries every adapter-owned collection the seam reads unconditionally', () => {
-    const profile = providerProfileOf(resolveConfig({
+    const configured = resolveConfig({
       models: [{ id: 'claude-opus-5', protocol: 'claude-code' }],
-    }))
+    }).providers[0]!
+    // The profile is only defined for a provider resolution deemed usable, which
+    // is exactly the invariant the type guard encodes.
+    if (!isUsable(configured)) throw new Error(`expected a usable provider, got: ${configured.error}`)
+    const profile = providerProfileOf(configured)
     expect(profile.modelErrors).toBeInstanceOf(Map)
     expect(profile.modelErrors.size).toBe(0)
     expect(profile.configuredMaxTokens).toBeInstanceOf(Map)

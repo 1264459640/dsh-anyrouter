@@ -8,15 +8,50 @@
  */
 
 /**
- * Identifiers the 0.1.7-rc.2 Host removed or renamed.
+ * Identifiers the pre-0.1.7 upgrade removed or renamed — some from the Host,
+ * some from this plugin — and that the scan still rejects.
  *
- * `settingsScope` was a browser service that does not exist anywhere in the
- * release (verified by grepping every shipped `.d.ts` under the installed
- * `.pnpm` tree: zero matches); `installSettingsSection` / `settingsNamespace` /
- * `SettingsSectionHooks` disappeared from `@deepseek-ai/dsh-settings`, whose
- * only runtime exports are now `SettingsForms` (default),
- * `SettingsConflictError`, and `redactSecrets`; `llm-anyrouter` was the old
- * settings namespace, replaced by the profile entry id.
+ * Removed from `@deepseek-ai/dsh-settings` before 0.1.7, i.e. present in the
+ * installed 0.1.5-rc.2 tree and absent from 0.1.7-rc.1 onward: `settingsScope`
+ * (a browser service; 57 lowercase hits across 10 `dsh-client-*` packages),
+ * `installSection` (98 hits), `SettingsSectionHooks` (34 hits),
+ * `SettingsProvider` (152 hits). The package's only runtime exports are now
+ * `SettingsForms` (default), `SettingsConflictError` and `redactSecrets`.
+ *
+ * Removed from THIS PLUGIN, not from a DSH package: `installSettingsSection`
+ * and `SETTINGS_NAMESPACE` were exports of `src/settings-compat.ts`, deleted in
+ * commit `2ca5e34`. `llm-anyrouter` was this plugin's old settings namespace,
+ * replaced by the profile entry id.
+ *
+ * The array therefore mixes two provenances: Host removals, plus guards against
+ * this plugin reintroducing its own deleted seam. Neither a "the Host removed
+ * it" nor a "we removed it" reading alone describes the whole list.
+ *
+ * Re-verified for the 0.2.0-rc.1 retarget and deliberately left unchanged: the
+ * whole-tree comparison of the installed 0.1.7-rc.2 and 0.2.0-rc.1 trees removed
+ * 0 files, added 0 files, and lost 0 `.d.ts` identifiers across all 21 installed
+ * `@deepseek-ai/dsh-*` packages, so no new token qualifies. The list only grows
+ * for a token genuinely present in the previous release and gone from the new
+ * one.
+ *
+ * Re-checked again for the 0.2.0-rc.2 retarget, which is a narrower diff: only
+ * four consumed packages changed at all between rc.1 and rc.2 — `dsh-llm`
+ * `lib/typert.host.js`, `dsh-llm-pi-ai` `lib/index.js` plus two `.d.ts`, and
+ * `dsh-api-remotes` `lib/client.js` plus two client types — and none of those
+ * files contains any token in this list, so nothing new qualifies there either.
+ * Note that the rc.2 upgrade did move real behaviour (`@earendil-works/pi-ai`
+ * 0.85 -> 0.87 and the Anthropic SDK with it); that is a dependency-generation
+ * change, not a removed settings API, so it belongs in the manifest and the
+ * README rather than in this array.
+ *
+ * CAUTION — `settingsNamespace` is NOT absent from either tree, and must not be
+ * read that way. `@deepseek-ai/dsh-settings` still ships the *type*
+ * `SettingsNamespace` (`lib/types/index.d.ts:6`, byte-identical in both
+ * releases). Because `removedApiTokensIn` matches case-insensitively, this token
+ * also matches that live type. That is the deliberate over-report documented
+ * there, not evidence that the package is gone — if `src/` ever legitimately
+ * needs `SettingsNamespace`, this scan WILL flag it, and the right fix is to
+ * rename the local usage, not to drop the token.
  */
 export const REMOVED_API = [
   'installSettingsSection',

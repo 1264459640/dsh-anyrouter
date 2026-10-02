@@ -1,20 +1,51 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import Anthropic from '@anthropic-ai/sdk'
+import { getCurrentTools, getInitialSystemMessage, hasToolRedefinitions, normalizeContext } from '@earendil-works/pi-ai'
 import { stream as anthropicStream } from '@earendil-works/pi-ai/api/anthropic-messages'
 import type {
   Api,
   AssistantMessageEvent,
-  Context,
   Model,
   ProviderStreams,
   ProviderHeaders,
   SimpleStreamOptions,
   StreamOptions,
+  SystemMessage,
   ThinkingLevel,
+  Tool,
+  TranscriptContext,
 } from '@earendil-works/pi-ai'
 import type { AnthropicOptions } from '@earendil-works/pi-ai/api/anthropic-messages'
+import { claudeCodeHeaders } from './headers.ts'
 
-const CLAUDE_CODE_VERSION = '2.1.239'
+/**
+ * The Claude Code release this transport reproduces.
+ *
+ * The plugin owns this value; it is deliberately NOT a configuration field.
+ * A user-chosen version string is a claim the user cannot back with a matching
+ * request shape, so exposing it invited exactly the drift it appeared to solve.
+ * Bumping it is a source change reviewed alongside `CLAUDE_CODE_BETAS` and the
+ * header table in `./headers.ts`, and `scripts/check-cli-versions.mjs` reports
+ * when a newer release exists.
+ */
+export const CLAUDE_CODE_VERSION = '2.1.286'
+
+/**
+ * The per-route fact the Claude Code transport cannot read off the model: the
+ * route id it answers as. One bundle instance may serve several relays at once,
+ * and each has its own route id, so it is not a module constant.
+ *
+ * Nothing about the client IDENTITY lives here. The version claim and the
+ * complete header set are the bundle's own (`./headers.ts`), which is what
+ * makes the fingerprint reproducible rather than user-dependent.
+ */
+export interface ClaudeCodeTransportOptions {
+  /** Provider route id this transport belongs to; replaces the bundle default. */
+  providerId?: string
+}
+
+/** The route id used when a caller builds a transport without naming one. */
+const DEFAULT_TRANSPORT_PROVIDER = 'anyrouter'
 
 export const CLAUDE_CODE_BETAS = [
   'claude-code-20250219',
@@ -29,25 +60,35 @@ export const CLAUDE_CODE_BETAS = [
 ] as const
 
 /**
- * Beta flags a model's own compatibility declaration requires, each paired with
- * the condition under which pi-ai acts on that capability.
+ * Beta flags a model's compatibility declaration requires, each paired with the
+ * condition under which pi-ai acts on that capability.
  *
  * This table exists because pi-ai's own beta assembly becomes unreachable the
  * moment a caller supplies an `anthropic-beta` header: `getBetaFeatures`
- * (`@earendil-works/pi-ai/dist/api/anthropic-messages.js:740-757`) returns the
+ * (`@earendil-works/pi-ai/dist/api/anthropic-messages.js:752-769`) returns the
  * configured value VERBATIM and never evaluates its conditions. Every flag
- * pi-ai would have derived from `model.compat` therefore has to be restated
- * here, or the request advertises a capability's body without its header.
+ * pi-ai would have derived from `model.compat` — and, for tool changes, from the
+ * transcript — therefore has to be restated here, or the request advertises a
+ * capability's body without its header.
  *
  * The list is exhaustive for the compat-gated flags: the two remaining pi-ai
  * defaults cannot fire on this route — `fine-grained-tool-streaming` needs
- * `supportsEagerToolInputStreaming === false` (`:1105-1106`, and pi-ai's compat
+ * `supportsEagerToolInputStreaming === false` (`:1150`, and pi-ai's compat
  * default is `true`), and `oauth-2025-04-20` is pushed only for an OAuth token
- * while supplying `options.client` pins `isOAuth` false (`:357-360`).
+ * while supplying `options.client` pins `isOAuth` false (`:771-772`).
+ *
+ * Those citations target `@earendil-works/pi-ai@0.87.1` and move between
+ * releases, so re-read the file rather than trusting them.
  */
 type AnthropicCompat = NonNullable<Model<'anthropic-messages'>['compat']>
 
-const COMPAT_BETAS: ReadonlyArray<{ when: (compat: AnthropicCompat) => boolean; betas: readonly string[] }> = [
+/** The transcript-shaped facts a beta condition may need beyond `compat`. */
+type BetaContext = Pick<TranscriptContext, 'messages'>
+
+const COMPAT_BETAS: ReadonlyArray<{
+  when: (compat: AnthropicCompat, context: BetaContext) => boolean
+  betas: readonly string[]
+}> = [
   {
     // pi-ai both sends these and transforms the body with them, inserting
     // thinking-level messages selected by model provider.
@@ -60,6 +101,23 @@ const COMPAT_BETAS: ReadonlyArray<{ when: (compat: AnthropicCompat) => boolean; 
     when: compat => (compat.allowedFallbackModels?.length ?? 0) > 0,
     betas: ['server-side-fallback-2026-07-01'],
   },
+  {
+    // pi-ai's native-tool-changes branch republishes the tool list as an
+    // anchored initial set plus deferred `tool_addition`/`tool_removal` blocks
+    // (`:852-863`) and would push this beta for it (`:786-787`). Its condition
+    // is transcript-shaped, not just `compat` (`:801-804`): both
+    // mid-conversation gates set, at least one initially active tool to anchor
+    // the deferred ones, and no redefined tool name (which the block form
+    // cannot express). This is the one entry a catalog regeneration can newly
+    // switch on, and getting it wrong ships a `defer_loading` body with no beta
+    // to authorize it — the exact failure the table above exists to prevent.
+    when: (compat, context) =>
+      compat.supportsMidConvoSystemMessages === true
+      && compat.supportsMidConvoToolChanges === true
+      && (getInitialSystemMessage(context.messages)?.toolsAdded?.length ?? 0) > 0
+      && !hasToolRedefinitions(context.messages),
+    betas: ['mid-conversation-tool-changes-2026-07-01'],
+  },
 ]
 
 /**
@@ -67,14 +125,16 @@ const COMPAT_BETAS: ReadonlyArray<{ when: (compat: AnthropicCompat) => boolean; 
  * Code set, every flag that model's compatibility declaration requires, and any
  * feature the caller explicitly asked for (a route's configured `headers`).
  * @param model - the resolved pi-ai model about to be called.
+ * @param context - the transcript pi-ai will receive, for conditions that need
+ * it rather than `compat` alone.
  * @param extra - caller-supplied feature names, appended verbatim.
  * @returns the ordered, de-duplicated feature list.
  */
-export function betaFeaturesOf(model: Model<Api>, extra: readonly string[] = []): string[] {
+export function betaFeaturesOf(model: Model<Api>, context: BetaContext, extra: readonly string[] = []): string[] {
   const compat = (model as Model<'anthropic-messages'>).compat
   return [...new Set<string>([
     ...CLAUDE_CODE_BETAS,
-    ...(compat === undefined ? [] : COMPAT_BETAS.flatMap(entry => entry.when(compat) ? entry.betas : [])),
+    ...(compat === undefined ? [] : COMPAT_BETAS.flatMap(entry => entry.when(compat, context) ? entry.betas : [])),
     ...extra,
   ])]
 }
@@ -119,15 +179,36 @@ function wireToolName(name: string): string {
   return CLAUDE_TOOL_NAMES[name.toLowerCase()] ?? name
 }
 
-function mappedContext(context: Context): { context: Context; fromWire: ReadonlyMap<string, string> } {
+function mappedContext(context: TranscriptContext): { context: TranscriptContext; fromWire: ReadonlyMap<string, string> } {
   const fromWire = new Map<string, string>()
-  for (const tool of context.tools ?? []) fromWire.set(wireToolName(tool.name).toLowerCase(), tool.name)
+  // pi-ai 0.87 removed `Context.tools` from the provider-facing context:
+  // `normalizeContext` folds the caller's flat tool list into the leading system
+  // message's `toolsAdded`. `getCurrentTools` replays the transcript's tool
+  // deltas in order and yields that same list for the single folded message this
+  // seam produces, so it is the exact successor of the removed `context.tools`
+  // (and stays right if a later system message adds or removes a tool, which the
+  // flat field could not express).
+  for (const tool of getCurrentTools(context.messages)) fromWire.set(wireToolName(tool.name).toLowerCase(), tool.name)
   const remap = (name: string): string => {
     const wire = wireToolName(name)
     if (!fromWire.has(wire.toLowerCase())) fromWire.set(wire.toLowerCase(), name)
     return wire
   }
+  const remapTool = (tool: Tool): Tool => ({ ...tool, name: remap(tool.name) })
+  const remapSystem = (message: SystemMessage): SystemMessage => {
+    const toolsAdded = message.toolsAdded?.map(remapTool)
+    // References are remapped in step with definitions: a removal must keep
+    // naming the same (now wire-named) tool, otherwise `getCurrentTools` inside
+    // pi-ai would keep advertising a tool the transcript had taken away.
+    const toolsRemoved = message.toolsRemoved?.map(reference => ({ ...reference, name: remap(reference.name) }))
+    if (toolsAdded === undefined && toolsRemoved === undefined) return message
+    const remapped: SystemMessage = { ...message }
+    if (toolsAdded !== undefined) remapped.toolsAdded = toolsAdded
+    if (toolsRemoved !== undefined) remapped.toolsRemoved = toolsRemoved
+    return remapped
+  }
   const messages = context.messages.map((message) => {
+    if (message.role === 'system') return remapSystem(message)
     if (message.role === 'assistant') {
       return {
         ...message,
@@ -137,13 +218,16 @@ function mappedContext(context: Context): { context: Context; fromWire: Readonly
     if (message.role === 'toolResult') return { ...message, toolName: remap(message.toolName) }
     return message
   })
-  const tools = context.tools?.map(tool => ({ ...tool, name: remap(tool.name) }))
   return {
-    context: {
-      ...context,
-      messages,
-      ...tools === undefined ? {} : { tools },
-    },
+    // Re-brand without re-folding: `normalizeContext` builds a leading system
+    // message only from its `systemPrompt`/`tools` arguments, and we pass
+    // neither. `createInitialSystemMessage(undefined, undefined)` then returns
+    // undefined and the message list is adopted unchanged, so the single system
+    // message pi-ai's `Models.streamSimple` already folded upstream (the prompt
+    // in `content`, the remapped declarations in `toolsAdded`) stays the only
+    // one. Passing `tools` here would be the double-fold: a second system message
+    // duplicating the prompt and re-declaring every tool.
+    context: normalizeContext({ messages }),
     fromWire,
   }
 }
@@ -189,25 +273,15 @@ function createClient(
   headers: ProviderHeaders | undefined,
   betas: readonly string[],
   send: typeof globalThis.fetch,
+  version: string,
 ): Anthropic {
-  const attribution = typeof headers?.['user-agent'] === 'string' ? ` ${headers['user-agent']}` : ''
   return new Anthropic({
     apiKey: null,
     authToken: apiKey,
     baseURL: model.baseUrl,
     maxRetries: 0,
-    defaultHeaders: {
-      ...headers,
-      accept: 'application/json',
-      // Kept for the request the SDK builds outside pi-ai's own beta assembly.
-      // The authoritative copy is `betas`, forwarded through the request
-      // options below, because pi-ai rebuilds the header from there.
-      'anthropic-beta': betas.join(','),
-      'anthropic-dangerous-direct-browser-access': 'true',
-      'user-agent': `claude-cli/${CLAUDE_CODE_VERSION} (external, sdk-cli)${attribution}`,
-      'x-app': 'cli',
-      ...sessionId === undefined ? {} : { 'x-claude-code-session-id': sessionId },
-    },
+    // The complete Claude Code identity, from the one table that owns it.
+    defaultHeaders: claudeCodeHeaders({ version, betas, sessionId, overrides: headers }),
     fetch: (input, init) => send(appendBetaQuery(input), init),
   })
 }
@@ -291,12 +365,15 @@ function budgetOf(level: ThinkingLevel): number {
 
 function runClaude(
   model: Model<Api>,
-  context: Context,
+  context: TranscriptContext,
   options: SimpleStreamOptions | undefined,
   send: typeof globalThis.fetch,
+  transport: ClaudeCodeTransportOptions,
 ): AsyncIterable<AssistantMessageEvent> {
+  const providerId = transport.providerId ?? DEFAULT_TRANSPORT_PROVIDER
+  const cliVersion = CLAUDE_CODE_VERSION
   const apiKey = options?.apiKey
-  if (apiKey === undefined || apiKey.trim().length === 0) throw new Error('No API key for provider: anyrouter')
+  if (apiKey === undefined || apiKey.trim().length === 0) throw new Error(`No API key for provider: ${providerId}`)
   const mapped = mappedContext(context)
   const reasoning = options?.reasoning
   const anthropicModel = model as Model<'anthropic-messages'>
@@ -309,14 +386,18 @@ function runClaude(
   const thinkingEnabled = reasoning !== undefined && (adaptive || (thinkingBudget ?? 0) >= 1_024)
   // pi-ai reconstructs `anthropic-beta` from `model.headers` and
   // `options.headers` alone (`getBetaFeatures` in
-  // `@earendil-works/pi-ai/dist/api/anthropic-messages.js:740-757`) and hands
+  // `@earendil-works/pi-ai/dist/api/anthropic-messages.js:752-769`) and hands
   // the result to the SDK's `betas` parameter, which REPLACES any
   // `anthropic-beta` on the client's default headers. The curated Claude Code
   // set therefore has to ride the request options to survive.
-  const betas = betaFeaturesOf(model, requestedBetas(headers))
+  //
+  // `mapped.context` — not `context` — is what pi-ai will evaluate, so the
+  // transcript-shaped conditions in COMPAT_BETAS are decided against exactly the
+  // messages the request carries.
+  const betas = betaFeaturesOf(model, mapped.context, requestedBetas(headers))
   const anthropicOptions: AnthropicOptions = {
     ...baseOptions,
-    client: createClient(model, apiKey, options?.sessionId, headers, betas, send),
+    client: createClient(model, apiKey, options?.sessionId, headers, betas, send, cliVersion),
     headers: { ...headers, 'anthropic-beta': betas.join(',') },
     thinkingDisplay: 'omitted',
     maxRetries: 0,
@@ -344,23 +425,37 @@ function runClaude(
  * settings edit that changes the proxy URL takes effect on the next request
  * without remounting the plugin. A route that configures no proxy receives the
  * global `fetch`, which is what every release before this seam used.
+ *
+ * The transport is otherwise parameterized by `transport`, which is what lets
+ * ONE bundle serve several relays: the route id it answers as, the CLI version
+ * it claims, and the extra betas it advertises all come from the provider entry
+ * that built it rather than from this module's constants.
  * @param resolveFetch - supplies the `fetch` this route must send with.
+ * @param transport - the owning provider's identity and beta overrides.
  * @returns the stream functions pi-ai's provider registry expects.
  */
 export function createClaudeCodeStreams(
   resolveFetch: () => typeof globalThis.fetch = () => globalThis.fetch,
+  transport: ClaudeCodeTransportOptions = {},
 ): ProviderStreams {
   return {
-    stream(model: Model<Api>, context: Context, options?: StreamOptions) {
+    stream(model: Model<Api>, context: TranscriptContext, options?: StreamOptions) {
       return runClaude(
         model,
         context,
         options as SimpleStreamOptions | undefined,
         resolveFetch(),
+        transport,
       ) as ReturnType<ProviderStreams['stream']>
     },
-    streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions) {
-      return runClaude(model, context, options, resolveFetch()) as ReturnType<ProviderStreams['streamSimple']>
+    streamSimple(model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) {
+      return runClaude(
+        model,
+        context,
+        options,
+        resolveFetch(),
+        transport,
+      ) as ReturnType<ProviderStreams['streamSimple']>
     },
   }
 }

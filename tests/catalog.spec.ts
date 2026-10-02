@@ -27,7 +27,7 @@ describe('reasoning profile persistence', () => {
     const resolved = resolveConfig({
       models: [{ id: 'claude-opus-5', protocol: 'claude-code', reasoning: { efforts: ['medium', 'high'], defaultEffort: 'high' } }],
     })
-    expect(resolved.models[0]!.reasoning).toEqual({ efforts: ['medium', 'high'], defaultEffort: 'high' })
+    expect(resolved.providers[0]!.models[0]!.reasoning).toEqual({ efforts: ['medium', 'high'], defaultEffort: 'high' })
   })
 
   it('a persisted effort set becomes the exact selector level list', () => {

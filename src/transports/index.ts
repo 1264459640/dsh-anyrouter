@@ -1,6 +1,22 @@
 export {
+  CLAUDE_CODE_BETAS,
+  CLAUDE_CODE_VERSION,
   claudeCodeStreams,
   createClaudeCodeStreams,
-  CLAUDE_CODE_BETAS,
+  type ClaudeCodeTransportOptions,
 } from './claude.ts'
-export { codexResponsesStreams, createCodexResponsesStreams } from './codex.ts'
+export {
+  CODEX_VERSION,
+  codexResponsesStreams,
+  createCodexResponsesStreams,
+  type CodexTransportOptions,
+} from './codex.ts'
+export {
+  ANTHROPIC_API_VERSION,
+  CODEX_ORIGINATOR,
+  claudeCodeHeaders,
+  codexHeaders,
+  hostDescriptor,
+  type ClaudeHeaderInput,
+  type CodexHeaderInput,
+} from './headers.ts'
